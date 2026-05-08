@@ -1,0 +1,17 @@
+# Google API credentials
+client_secrets.json
+token.json
+credentials.json
+
+# Selenium/Chrome driver (if present)
+chromedriver.exe
+
+# Debug files
+*.html
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

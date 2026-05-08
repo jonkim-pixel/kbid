@@ -1,0 +1,1220 @@
+# -*- coding: utf-8 -*-
+"""
+KBID 입찰 정보 크롤러 (구글 시트 연동 버전)
+파일명: kbid_Crawling_main.py
+
+[사전 준비]
+1. pip install gspread google-auth selenium pandas
+2. credentials.json 파일(구글 API 인증키)을 같은 폴더에 준비
+3. 구글 시트 이름: '입찰관리' (시트 내에 '입찰공고', '투찰준비' 탭 필요)
+"""
+
+import time
+import re
+import os
+import gspread
+import traceback
+from datetime import datetime, timedelta
+from urllib.parse import quote_plus
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+class KbidConfig:
+    """설정값 및 셀렉터 관리"""
+    LOGIN_URL = "https://www.kbid.co.kr/login/common_login.htm"
+    SEARCH_URL_TEMPLATE = "https://www.kbid.co.kr/search/index.htm?mid=lge123&txtFindWordTop={}"
+    
+    # 구글 시트 설정 (OAuth 2.0 방식으로 변경)
+    CLIENT_SECRETS_FILE = "client_secrets.json"
+    TOKEN_FILE = "token.json"  # 로그인 후 자동 생성됨
+    SPREADSHEET_NAME = "입찰관리"
+    
+    SELECTORS = {
+        "login_check": [
+            "//*[contains(text(), '로그아웃')]",
+            "//*[contains(text(), '로그 아웃')]",
+            "//*[contains(text(), '마이페이지')]",
+            "//a[contains(@href, 'logout')]"
+        ],
+        "search_results": "#listBody1 tr, tbody#listBody1 tr, table#listBody1 tr, .search-result tr, tbody tr, table tr",
+        "bid_links": "#listBody1 a[href]",
+        "detail_title": "td.h_tit",
+        "schedule_date": "//div[contains(@class, 'scheduler_flowchart')]//li[contains(@class, 'on')]//div[@class='area_date']",
+        "th_td_pair": "(//th[contains(text(), '{label}')])[last()]/following-sibling::td[1]"
+    }
+
+class GoogleSheetsManager:
+    """구글 시트 데이터 입출력 관리 (OAuth 2.0 적용)"""
+    def __init__(self):
+        if not os.path.exists(KbidConfig.CLIENT_SECRETS_FILE):
+            raise FileNotFoundError(f"'{KbidConfig.CLIENT_SECRETS_FILE}' 파일이 없습니다. OAuth JSON 파일을 준비해주세요.")
+            
+        # gspread.oauth()는 브라우저를 열어 사용자 인증을 처리합니다.
+        self.client = gspread.oauth(
+            credentials_filename=KbidConfig.CLIENT_SECRETS_FILE,
+            authorized_user_filename=KbidConfig.TOKEN_FILE
+        )
+        
+        # 시트가 없으면 새로 생성하는 로직 추가
+        try:
+            self.sheet = self.client.open(KbidConfig.SPREADSHEET_NAME)
+            self._ensure_prepare_headers()
+        except gspread.exceptions.SpreadsheetNotFound:
+            print(f"✨ '{KbidConfig.SPREADSHEET_NAME}' 시트를 찾을 수 없어 새로 생성합니다...")
+            self.sheet = self.client.create(KbidConfig.SPREADSHEET_NAME)
+            self._initialize_sheets()
+            print("✅ 시트 구조 생성이 완료되었습니다. 구글 드라이브에서 '입찰관리' 시트를 열어")
+            print("   '입찰공고' 탭의 '*공고명' 아래에 작업할 공고명을 입력 후 다시 실행해 주세요.")
+            os._exit(0) # 처음 생성 시에는 데이터가 없으므로 즉시 종료
+
+    def _initialize_sheets(self):
+        """기본 시트 구성 및 헤더 세팅"""
+        # 1. 입찰공고 시트 (읽기용) 생성
+        try:
+            ws_announce = self.sheet.add_worksheet(title="입찰공고", rows="100", cols="10")
+            ws_announce.append_row(["*공고명", "공고번호", "기타메모"]) 
+        except: pass
+        
+        # 2. 투찰준비 시트 (쓰기용) 생성
+        try:
+            ws_prepare = self.sheet.add_worksheet(title="투찰준비", rows="100", cols="25")
+            headers = [
+                "투찰상태", "공고번호", "공고명", "지역제한", "입찰개시일", "투찰마감일시", "개찰일시",
+                "기초금액", "예가변동폭", "투찰하한율", "계약방법",
+                "예상투찰가1", "예상투찰가2", "예상투찰가3",
+                "AIR 채호원 입찰금액", "AIR 채호원 순위",
+                "에어채호원 입찰금액", "에어채호원 순위",
+                "참여 업체수", "사정률", "1등 업체사정률", "1등 상호명"
+            ]
+            ws_prepare.append_row(headers)
+        except: pass
+        
+        # 기본 'Sheet1' 삭제
+        try:
+            default_ws = self.sheet.get_worksheet(0)
+            if default_ws.title == "Sheet1":
+                self.sheet.del_worksheet(default_ws)
+        except: pass
+
+    def _ensure_prepare_headers(self):
+        """기존 '투찰준비' 시트 헤더를 최신 구조로 재구성"""
+        try:
+            ws = self.sheet.worksheet("투찰준비")
+        except gspread.exceptions.WorksheetNotFound:
+            return
+
+        desired_headers = [
+            "투찰상태", "공고번호", "공고명", "지역제한", "입찰개시일", "투찰마감일시", "개찰일시",
+            "기초금액", "예가변동폭", "투찰하한율", "계약방법",
+            "예상투찰가1", "예상투찰가2", "예상투찰가3",
+            "AIR 채호원 입찰금액", "AIR 채호원 순위",
+            "에어채호원 입찰금액", "에어채호원 순위",
+            "참여 업체수", "사정률", "1등 업체사정률", "1등 상호명"
+        ]
+
+        current_headers = [h.replace("*", "").strip() for h in ws.row_values(1)]
+        if current_headers == desired_headers:
+            return
+
+        all_values = ws.get_all_values()
+        new_rows = [desired_headers]
+
+        for row in all_values[1:]:
+            new_row = ["" for _ in desired_headers]
+            for idx, val in enumerate(row):
+                if idx >= len(current_headers):
+                    continue
+                header_name = current_headers[idx]
+                if header_name in desired_headers:
+                    new_row[desired_headers.index(header_name)] = val
+            new_rows.append(new_row)
+
+        ws.clear()
+        ws.update("A1", new_rows)
+
+    def get_search_terms(self):
+        """'입찰공고' 시트에서 '공고명' 및 '공고번호' 데이터를 가져옵니다."""
+        ws = self.sheet.worksheet("입찰공고")
+        all_data = ws.get_all_records()
+        
+        tasks = []
+        for row in all_data:
+            # 헤더 이름에 '*'가 포함될 수 있으므로 유연하게 처리
+            name = next((v for k, v in row.items() if "공고명" in k), "")
+            num = next((v for k, v in row.items() if "공고번호" in k), "")
+            if name or num:
+                clean_name = re.sub(r'^(?:결|전|수|취)\s*', '', str(name)).strip()
+                clean_name = clean_name.replace("(과거 공고)", "").replace("(취소)", "").strip()
+                tasks.append({"name": clean_name, "num": str(num).strip()})
+        return tasks
+
+    def get_processed_bids(self):
+        """이미 '투찰준비' 시트에 기록된 공고번호 목록을 가져옵니다."""
+        try:
+            ws = self.sheet.worksheet("투찰준비")
+            # 두 번째 컬럼(공고번호)의 모든 값을 가져옴 (B열)
+            return set(ws.col_values(2)[1:])
+        except:
+            return set()
+
+    def _parse_datetime(self, text):
+        if not text:
+            return None
+
+        text = text.replace('\xa0', ' ')
+        text = text.replace('년', '-').replace('월', '-').replace('일', ' ').replace('시', ':').replace('분', ' ')
+        text = re.sub(r'[^0-9:\-\.\/ ]', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        patterns = [
+            r'\d{4}[./\-]\d{1,2}[./\-]\d{1,2}\s+\d{1,2}:\d{1,2}:?\d{0,2}',
+            r'\d{4}[./\-]\d{1,2}[./\-]\d{1,2}\s+\d{1,2}:\d{1,2}',
+            r'\d{4}[./\-]\d{1,2}[./\-]\d{1,2}',
+        ]
+
+        for pat in patterns:
+            match = re.search(pat, text)
+            if match:
+                candidate = match.group().strip()
+                candidate = candidate.replace('.', '-').replace('/', '-')
+                parts = re.findall(r'\d+', candidate)
+                if len(parts) >= 5:
+                    year, month, day, hour, minute = map(int, parts[:5])
+                    return datetime(year, month, day, hour, minute)
+                if len(parts) >= 3:
+                    year, month, day = map(int, parts[:3])
+                    return datetime(year, month, day, 0, 0)
+        return None
+
+    def update_bid_statuses(self):
+        """투찰준비 시트의 개찰일시를 기준으로 상태를 갱신합니다."""
+        try:
+            ws = self.sheet.worksheet("투찰준비")
+        except gspread.exceptions.WorksheetNotFound:
+            return
+
+        headers = [h.replace("*", "").strip() for h in ws.row_values(1)]
+        try:
+            status_idx = headers.index("투찰상태")
+            open_idx = headers.index("개찰일시")
+            close_idx = headers.index("투찰마감일시") if "투찰마감일시" in headers else None
+        except ValueError:
+            print("⚠️ 투찰준비 시트의 필수 컬럼을 찾을 수 없습니다.")
+            print(f"   현재 헤더: {headers}")
+            return
+
+        rows = ws.get_all_values()[1:]
+        updates = []
+        now = datetime.now()
+        
+        print(f"📊 투찰준비 시트 검사: 총 {len(rows)}행, 현재시간 {now.strftime('%Y-%m-%d %H:%M')}")
+        print(f"   헤더 인덱스 - 투찰상태({status_idx}), 개찰일시({open_idx}), 투찰마감({close_idx})")
+
+        for row_idx, row in enumerate(rows, start=2):
+            # 행이 비어있으면 건너뛰기
+            if not row or all(cell.strip() == "" for cell in row):
+                continue
+                
+            current_status = row[status_idx].strip() if len(row) > status_idx else ""
+            bid_no = row[1].strip() if len(row) > 1 else ""
+            
+            # 결과확인 상태는 더 이상 변경하지 않음
+            if current_status == "결과확인":
+                continue
+
+            open_text = row[open_idx].strip() if len(row) > open_idx else ""
+            open_time = self._parse_datetime(open_text)
+            close_time = None
+            close_text = ""
+            if close_idx is not None and len(row) > close_idx:
+                close_text = row[close_idx].strip()
+                close_time = self._parse_datetime(close_text)
+
+            print(f"  [{row_idx}] {bid_no}: 상태='{current_status}' | 개찰={open_text} (파싱: {open_time}) | 투찰마감={close_text if close_idx else 'N/A'}")
+
+            # 결정할 새로운 상태
+            new_status = None
+            
+            # 1. 상태가 비어있으면 기본값으로 "투찰대기" 설정
+            # (추가: 실제로 데이터가 있으면 아래 로직으로 자동 결정)
+            if not current_status:
+                # 투찰마감일시 기준으로 상태 자동 결정
+                if close_time and now >= close_time:
+                    new_status = "투찰완료"  # 마감 지남 (개찰 전)
+                elif open_time and now >= open_time:
+                    new_status = "결과확인"  # 개찰 지남
+                else:
+                    new_status = "투찰대기"  # 투찰 가능 기간
+                print(f"       → 상태 비어있음: 자동으로 '{new_status}'로 설정")
+            
+            # 2. 이미 상태가 있으면 개찰일시 기준으로만 "결과확인"으로 업데이트
+            elif current_status == "투찰대기" or current_status == "투찰완료":
+                if open_time and now >= open_time:
+                    new_status = "결과확인"
+                    print(f"       → 개찰일시 경과: {open_time.strftime('%Y-%m-%d %H:%M')} <= {now.strftime('%Y-%m-%d %H:%M')}")
+                elif close_time and now >= close_time and not open_time:
+                    # 개찰일시가 없고 투찰마감만 지난 경우
+                    new_status = "투찰완료"
+                    print(f"       → 투찰마감 경과: {close_time.strftime('%Y-%m-%d %H:%M')} <= {now.strftime('%Y-%m-%d %H:%M')}")
+
+            # 3. 상태 변경 필요 시 업데이트 목록에 추가
+            if new_status:
+                cell_name = gspread.utils.rowcol_to_a1(row_idx, status_idx + 1)
+                updates.append((cell_name, new_status))
+
+        if updates:
+            batch_data = [{"range": cell, "values": [[value]]} for cell, value in updates]
+            ws.batch_update(batch_data)
+            print(f"✅ {len(updates)}건의 투찰상태를 업데이트했습니다.")
+            return len(updates)
+        else:
+            print("  → 상태 변경 필요 항목 없음")
+        return 0
+
+    def save_result(self, data_dict):
+        """추출된 데이터를 '투찰준비' 시트에 저장 (중복 시 업데이트)"""
+        try:
+            ws = self.sheet.worksheet("투찰준비")
+            headers = ws.row_values(1)
+            bid_no = data_dict.get("공고번호", "").strip()
+            
+            # 공고명에서 상태 표시 접두사 제거 (결, 전, 수, 취 등) 및 '(과거 공고)' 제거
+            if "공고명" in data_dict:
+                original_name = data_dict["공고명"]
+                # 상태 표시 접두사 제거 (반드시 공백이 있는 경우에만 제거하여 '전주대' 등이 '주대'로 훼손되는 것 방지)
+                cleaned_name = re.sub(r"^(결|전|수|취|긴|견|재)\s+", "", original_name).strip()
+                # (과거 공고) 제거
+                cleaned_name = cleaned_name.replace("(과거 공고)", "").strip()
+                data_dict["공고명"] = cleaned_name
+
+            # 만약 공고명에 '(취소)'가 포함되어 있으면 투찰상태를 '공고 취소'로 설정
+            if "공고명" in data_dict and "(취소)" in data_dict["공고명"]:
+                data_dict["투찰상태"] = "공고 취소"
+                data_dict["공고명"] = data_dict["공고명"].replace("(취소)", "").strip() # 공고명에서 (취소) 제거
+
+            # 헤더 순서에 맞춰 데이터 배열 생성
+            row_to_save = []
+            for h in headers:
+                clean_h = h.replace("*", "").strip()
+                row_to_save.append(data_dict.get(clean_h, ""))
+
+            # 기존 데이터에서 공고번호 열(2번째 열) 검색
+            all_bid_nos = ws.col_values(2)
+            
+            try:
+                # 이미 존재하는 경우 해당 행 번호 찾기 (1-based index)
+                row_idx = all_bid_nos.index(bid_no) + 1
+                # 해당 행 업데이트 (A{idx}:Z{idx} 범위 계산)
+                end_col = chr(64 + len(headers)) if len(headers) <= 26 else "Z"
+                range_name = f"A{row_idx}:{end_col}{row_idx}"
+                ws.update(range_name, [row_to_save])
+                print(f"🔄 기존 데이터 업데이트 완료: {bid_no}")
+            except ValueError:
+                # 존재하지 않는 경우 새로 추가
+                ws.append_row(row_to_save)
+                print(f"✅ 새 데이터 추가 완료: {bid_no}")
+            
+            return True
+        except Exception as e:
+            print(f"❌ 구글 시트 저장 오류: {e}")
+            traceback.print_exc()
+            return False
+
+class KbidBrowser:
+    """브라우저 자동화 및 탐지 우회 제어"""
+    def __init__(self, gs_manager):
+        self.gs = gs_manager # GoogleSheetsManager 인스턴스 저장
+        self.driver = self._init_driver()
+
+    def _init_driver(self):
+        options = Options()
+        options.add_argument("--incognito")
+        options.page_load_strategy = 'eager'  # DOM만 로드되면 즉시 진행 (이미지/광고 대기 방지)
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0')
+        
+        driver = webdriver.Chrome(options=options)
+        # 탐지 우회를 위한 스크립트 실행
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+        # 암묵적 대기: 2초로 설정 (동적 요소 렌더링 대기)
+        driver.set_page_load_timeout(30)
+        driver.implicitly_wait(2)
+        return driver
+
+    def wait_for_login(self):
+        """수동 로그인 대기 (현재 상태 확인 후 필요시 대기)"""
+        # 먼저 검색 페이지로 시도 (이미 로그인되었으면 접근 가능)
+        self.driver.get(KbidConfig.SEARCH_URL_TEMPLATE.format(""))
+        time.sleep(0.5)
+        
+        current_url = self.driver.current_url.lower()
+        
+        # 이미 로그인 상태면 바로 반환
+        if "login" not in current_url:
+            print("✅ 이미 로그인 상태입니다.")
+            return True
+        
+        # 로그인이 필요한 상태면 로그인 페이지로 이동
+        print("\n🔑 브라우저에서 로그인을 완료해주세요 (최대 3분)...")
+        self.driver.get(KbidConfig.LOGIN_URL)
+        
+        start_time = time.time()
+        timeout = 180  # 3분
+        
+        while time.time() - start_time < timeout:
+            try:
+                # 현재 URL 확인
+                current_url = self.driver.current_url.lower()
+                if "login" not in current_url:
+                    print("✅ 로그인 확인되었습니다.")
+                    time.sleep(0.5)
+                    return True
+                
+                # 로그인 요소들 확인 (예: 로그아웃 버튼 등)
+                for selector in KbidConfig.SELECTORS["login_check"]:
+                    try:
+                        self.driver.find_element(By.XPATH, selector)
+                        print("✅ 로그인 확인되었습니다.")
+                        time.sleep(0.5)
+                        return True
+                    except:
+                        pass
+                
+                # 진행 상태 표시
+                remaining = int(timeout - (time.time() - start_time))
+                if remaining % 10 == 0:
+                    print(f"⏳ 로그인 대기 중... (남은 시간: {remaining}초)")
+                
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"⚠️ 로그인 감지 중 오류: {e}")
+                time.sleep(0.5)
+        
+        print("❌ 로그인 감지 실패 (시간 초과)")
+        return False
+
+    def navigate_to_bid(self, task):
+        """공고명/번호로 검색 후 정확한 공고번호 확인하여 상세 페이지 이동"""
+        name = task.get("name", "")
+        raw_num = task.get("num", "")
+        
+        # 핵심 번호만 추출 (예: R26BK01488658-000)
+        # 문자열 내에서 영문+숫자+하이픈 조합의 긴 패턴을 찾음
+        match = re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', raw_num)
+        clean_num = match.group() if match else raw_num.strip()
+        
+        # 검색어 결정: 공고번호를 우선 사용 (공고명 검색 실패 시)
+        search_term_raw = clean_num if clean_num else name
+        if not search_term_raw: return False
+
+        # 공고명일 경우 괄호 접두사 제거
+        if not clean_num:
+            search_term_raw = re.sub(r'^[\(\[\{]\s*[^\)\]\}]+\s*[\)\]\}]\s*', '', search_term_raw).strip()
+        
+        search_term = quote_plus(search_term_raw)
+        url = KbidConfig.SEARCH_URL_TEMPLATE.format(search_term)
+        print(f"   [디버그] 페이지 이동 시도: {url}")
+        
+        # 페이지 로드 타임아웃 및 전략 설정
+        try:
+            self.driver.set_page_load_timeout(20)
+            self.driver.get(url)
+        except Exception as e:
+            print(f"   ⚠️ 페이지 로드 시간 초과 또는 오류 (무시하고 진행): {e}")
+            try: self.driver.execute_script("window.stop();")
+            except: pass
+            
+        time.sleep(0.5)
+        
+        # 로그인 페이지로 튕겼는지 확인
+        if "login" in self.driver.current_url.lower():
+            print("   ⚠️ 세션 만료 또는 로그아웃 감지 - 재로그인 대기")
+            if not self.wait_for_login(): return False
+            self.driver.get(url)
+            time.sleep(1)
+
+        try:
+            print(f"   [디버그] 현재 창 개수: {len(self.driver.window_handles)}", flush=True)
+            print(f"   [디버그] 현재 URL: {self.driver.current_url}", flush=True)
+            
+            # 모든 창 확인
+            for i, handle in enumerate(self.driver.window_handles):
+                try:
+                    self.driver.switch_to.window(handle)
+                    print(f"      - 창 {i} URL: {self.driver.current_url}")
+                except: pass
+            
+            # 원래 창으로 복귀 (마지막 창 기준)
+            self.driver.switch_to.window(self.driver.window_handles[-1])
+
+            # 디버깅을 위해 페이지 소스 저장
+            try:
+                with open("search_debug.html", "w", encoding="utf-8") as f:
+                    f.write(self.driver.page_source)
+                print("   [디버그] search_debug.html 저장 완료")
+            except: pass
+            
+            if "잘못된 접근" in self.driver.page_source:
+                print("   [디버그] '잘못된 접근' 감지 - 재접속 시도")
+                self.driver.get("https://www.kbid.co.kr/search/index.htm?mid=lge123")
+                time.sleep(0.5)
+                self.driver.get(url)
+                time.sleep(1)
+
+            # 탐색 함수: 메인 프레임에서만 찾기
+            # (kbid.co.kr 검색 결과는 항상 메인 프레임에 있으며,
+            #  광고/추적 iframe 순회가 120초 타임아웃을 유발했던 핵심 원인)
+            def find_in_frames(selector):
+                try:
+                    by_type = By.XPATH if selector.startswith("/") or selector.startswith("(") else By.CSS_SELECTOR
+                    
+                    # 1. 메인 프레임 확인
+                    self.driver.switch_to.default_content()
+                    elements = self.driver.find_elements(by_type, selector)
+                    if elements: return elements
+                    
+                    # 2. 아이프레임 및 프레임 탐색 (단일 레벨만 확인하여 지연 방지)
+                    all_frames = self.driver.find_elements(By.XPATH, "//iframe | //frame")
+                    for f in all_frames:
+                        try:
+                            # 프레임 전환
+                            self.driver.switch_to.frame(f)
+                            # 해당 프레임에서 요소 찾기
+                            elements = self.driver.find_elements(by_type, selector)
+                            if elements: return elements
+                            # 못 찾았으면 상위로 복귀
+                            self.driver.switch_to.default_content()
+                        except:
+                            try: self.driver.switch_to.default_content()
+                            except: pass
+                            continue
+                except Exception:
+                    pass
+                
+                try: self.driver.switch_to.default_content()
+                except: pass
+                return []
+
+            # 페이지 로드 후 아이프레임/AJAX 로딩 대기
+            time.sleep(2.0)
+            
+            # 검색 단계에서는 즉시 응답하도록 암묵적 대기 0초 설정
+            self.driver.implicitly_wait(0)
+            
+            # 1단계: 페이지 로드 및 AJAX 테이블 확인
+            print(f"⏳ 페이지 로드 및 데이터 수집 대기 중 (키워드: {search_term_raw[:20]}...)...")
+            table_found = False
+            for i in range(5): # 최대 5초간 테이블 컨테이너 확인
+                # KBID 검색 결과 테이블 ID: idCBidTable
+                if find_in_frames("#idCBidTable, .tbl_search_list, #listBody1"):
+                    table_found = True
+                    break
+                time.sleep(1)
+            
+            if not table_found:
+                print("   ⚠️ 결과 테이블 컨테이너를 찾지 못했습니다. (프레임 확인 중...)")
+
+            # 2단계: 비동기 데이터(AJAX) 로딩 대기 및 행 탐색
+            print("⏳ 입찰공고 데이터 로딩 대기 중...")
+            bid_rows = []
+            
+            # AJAX로 tbody가 채워지는 것을 기다림 (최대 10초)
+            for wait_step in range(10):
+                xpath_candidates = [
+                    "//tbody[@id='listBody1']//tr[td//a]", # 최근 입찰공고 전용 리스트
+                    "//tr[contains(@onclick, 'Gview') and ancestor::tbody[@id='listBody1']]", # 상세페이지 링크 (listBody1 내부)
+                ]
+                
+                for xp in xpath_candidates:
+                    try:
+                        rows = find_in_frames(xp)
+                        if rows:
+                            real = []
+                            for r in rows:
+                                try:
+                                    txt = r.get_attribute("innerText") or ""
+                                    # 공고번호 패턴이 있는지 확인
+                                    if re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', txt) or re.search(r'\d{10}-\d{2}', txt):
+                                        real.append(r)
+                                except: continue
+                            if real:
+                                bid_rows = real
+                                break
+                    except: continue
+                
+                if bid_rows:
+                    print(f"   ✅ 데이터 행 {len(bid_rows)}개 감지 완료")
+                    break
+                
+                # 아직 데이터가 없으면 잠시 대기
+                if wait_step % 2 == 0:
+                    print(f"   ...데이터 기다리는 중 ({wait_step+1}s)")
+                time.sleep(1)
+
+            if not bid_rows:
+                # 3초 더 대기 후 재시도
+                print("   ⚠️ 즉시 탐색 실패, 3초 대기 후 재시도...")
+                time.sleep(3)
+                for xp in xpath_candidates:
+                    rows = find_in_frames(xp)
+                    real = []
+                    for r in rows:
+                        try:
+                            txt = r.text
+                            if re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', txt) or re.search(r'\d{10}-\d{2}', txt):
+                                if r.find_elements(By.TAG_NAME, "a"):
+                                    real.append(r)
+                        except: continue
+                    if real:
+                        bid_rows = real
+                        print(f"   [디버그] 재시도 성공: {len(bid_rows)}개 행")
+                        break
+
+            print(f"   [디버그] 최종 탐색 행 수: {len(bid_rows)}")
+
+            if not bid_rows:
+                print("   ⚠️ 공고 데이터를 찾지 못했습니다.")
+
+            # 매칭 시도
+            print(f"📌 매칭 시도...")
+            target_row = None
+            cancel_row = None
+
+            for row in bid_rows:
+                try:
+                    row_text = row.text.replace("\n", " ").strip()
+                    row_html = row.get_attribute("innerHTML")
+                except:
+                    continue
+                
+                # 공고번호 또는 공고명 매칭 (공백/특수문자 제거 후 비교)
+                short_name = name[:10]
+                name_only_ko = re.sub(r'[^가-힣0-9]', '', name)
+                row_text_ko = re.sub(r'[^가-힣0-9]', '', row_text)
+
+                is_match = False
+                if clean_num and clean_num in row_text:
+                    is_match = True
+                elif short_name and short_name in row_text:
+                    is_match = True
+                elif name_only_ko[:8] in row_text_ko:
+                    is_match = True
+
+                if is_match:
+                    print(f"   🔎 매칭 후보: {row_text[:60]}...")
+                    
+                    is_canceled = (
+                        "(취소)" in row_text
+                        or 'alt="취"' in row_html
+                        or 'alt="결"' in row_html
+                    )
+                    if is_canceled:
+                        if cancel_row is None: cancel_row = row
+                        continue
+                    target_row = row
+                    break
+
+            final_row = target_row or cancel_row
+
+            if final_row:
+                try:
+                    link = final_row.find_element(By.TAG_NAME, "a")
+                    print(f"✅ 일치 항목 발견 → 클릭")
+                    self.driver.execute_script("arguments[0].click();", link)
+                    
+                    # 새 창이 열릴 때까지 최대 10초 대기
+                    for _ in range(20):
+                        if len(self.driver.window_handles) > 1:
+                            break
+                        time.sleep(0.5)
+                    
+                    if len(self.driver.window_handles) > 1:
+                        self.driver.switch_to.window(self.driver.window_handles[-1])
+                    
+                    # 상세 페이지 완전 로드 대기 (readyState = complete)
+                    print("   ⏳ 상세 페이지 로드 대기 중...")
+                    for _ in range(20):
+                        try:
+                            state = self.driver.execute_script("return document.readyState")
+                            if state == "complete":
+                                break
+                        except: pass
+                        time.sleep(0.5)
+                    
+                    # 핵심 데이터 영역이 DOM에 나타날 때까지 추가 대기
+                    for _ in range(10):
+                        try:
+                            elems = self.driver.find_elements(By.XPATH, "//th[contains(text(), '기초금액') or contains(text(), '발주처 공고번호')]")
+                            if elems:
+                                break
+                        except: pass
+                        time.sleep(0.5)
+                    
+                    print("   ✅ 상세 페이지 로드 완료")
+                    return True
+                except Exception as e:
+                    print(f"⚠️ 클릭 실패: {e}")
+
+            # 실패 시 디버깅용 파일 저장
+            print(f"🔍 입찰공고를 찾지 못했습니다.")
+            try:
+                with open("search_result_debug.html", "w", encoding="utf-8") as f:
+                    f.write(self.driver.page_source)
+                print(f"💾 search_result_debug.html 저장 완료")
+            except: pass
+            print(f"❌ '{name}'에 해당하는 입찰공고를 찾을 수 없습니다.")
+            
+        except Exception as e:
+            print(f"❌ 검색 과정 중 오류 발생: {e}")
+            traceback.print_exc()
+        finally:
+            # 상세 페이지 파싱을 위해 암묵적 대기 2초로 복구
+            self.driver.implicitly_wait(2)
+        return False
+
+
+class KbidParser:
+    """HTML 파싱 및 데이터 추출"""
+    def __init__(self, driver):
+        self.driver = driver
+
+    def get_val(self, label):
+        """th/td 라벨 기준 데이터 추출 (유연한 매칭 및 숫자 보정 포함)"""
+        if not label: return ""
+        
+        # 1. 시도할 XPath 목록 (normalize-space()로 공백 무시, th/td 모두 탐색)
+        # label이 "입찰(개찰) 일시" 처럼 복잡할 경우를 대비해 contains 매칭 사용
+        xpaths = [
+            f"(//th|//td)[contains(normalize-space(.), '{label}')][last()]/following-sibling::td[1]",
+            f"(//th|//td)[contains(., '{label}')][last()]/following-sibling::td[1]",
+        ]
+        
+        # "입찰(개찰) 일시" 특수 처리
+        if "(" in label and ")" in label:
+            core = label.split(")")[-1].strip() # " 일시"
+            if core:
+                xpaths.append(f"(//th|//td)[contains(normalize-space(.), '{core}')][last()]/following-sibling::td[1]")
+
+        for xpath in xpaths:
+            try:
+                # 0.5초 짧은 대기 (전체 implicitly_wait 2초 중 일부 사용)
+                element = self.driver.find_element(By.XPATH, xpath)
+                text = (element.get_attribute("textContent") or element.text).replace("복사", "").strip()
+                
+                # 만약 가져온 텍스트가 비어있거나 '로딩중' 이면 다음 XPath 시도
+                if not text or "로딩" in text:
+                    continue
+                    
+                # 숫자가 없는 경우 input value 확인 (금액 필드 등)
+                if any(k in label for k in ["금액", "가", "율"]) and not re.search(r"\d", text):
+                    try:
+                        val = element.find_element(By.XPATH, ".//input[@value]").get_attribute("value")
+                        if val: text = val + (" 원" if "원" in text else "")
+                    except: pass
+                
+                return re.sub(r"\s+", " ", text)
+            except:
+                continue
+        return ""
+
+    def get_val_base_price(self):
+        """기초금액 전용 추출 (다중 패턴 재시도 포함)"""
+        # 패턴 1: 기본 th/td 방식
+        result = self.get_val("기초금액")
+        if result and re.search(r"\d", result):
+            return result
+
+        print("   [기초금액] 기본 패턴 실패 → 대체 패턴 시도...")
+
+        # 패턴 2: th 텍스트가 정확히 '기초금액'인 경우 (공백/BR 포함)
+        alt_xpaths = [
+            "//th[normalize-space(.)='기초금액']/following-sibling::td[1]",
+            "//th[contains(text(),'기초금액')]/following-sibling::td[1]",
+            "//td[normalize-space(.)='기초금액']/following-sibling::td[1]",
+            "//td[contains(text(),'기초금액')]/following-sibling::td[1]",
+            "//*[contains(@class,'base') and contains(text(),'기초')]/following-sibling::*[1]",
+            "//label[contains(text(),'기초금액')]/following-sibling::*[1]",
+        ]
+        for xpath in alt_xpaths:
+            try:
+                elems = self.driver.find_elements(By.XPATH, xpath)
+                for elem in elems:
+                    text = (elem.get_attribute("textContent") or elem.text).replace("복사", "").strip()
+                    text = re.sub(r"\s+", " ", text)
+                    if text and re.search(r"\d", text):
+                        print(f"   [기초금액] 대체 패턴 성공: {xpath} → '{text}'")
+                        return text
+            except: continue
+
+        # 패턴 3: 페이지 전체 텍스트에서 정규식으로 추출
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            match = re.search(r"기초금액\s*[:\s]*([0-9,]+)\s*원?", body_text)
+            if match:
+                text = match.group(1)
+                print(f"   [기초금액] 전체 텍스트 추출 성공: '{text}'")
+                return text
+        except: pass
+
+        print("   [기초금액] 모든 패턴 실패 → 빈값 반환")
+        return ""
+
+    def _parse_datetime(self, text):
+        if not text:
+            return None
+
+        text = re.sub(r'["\u00A0]', ' ', text)
+        text = text.replace('년', '-').replace('월', '-').replace('일', ' ').replace('시', ':').replace('분', ' ')
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        patterns = [
+            r'(\d{4}[./\-]\d{1,2}[./\-]\d{1,2}\s+\d{1,2}[:：]\d{1,2})',
+            r'(\d{4}[./\-]\d{1,2}[./\-]\d{1,2})',
+            r'(\d{2}[./\-]\d{1,2}[./\-]\d{1,2}\s+\d{1,2}[:：]\d{1,2})',
+            r'(\d{2}[./\-]\d{1,2}[./\-]\d{1,2})'
+        ]
+
+        for pat in patterns:
+            match = re.search(pat, text)
+            if match:
+                date_text = re.sub(r'[^0-9:\- ]', ' ', match.group()).strip()
+                parts = re.findall(r'\d+', date_text)
+                if len(parts) >= 5:
+                    year = int(parts[0])
+                    if year < 100:
+                        year += 2000
+                    month, day, hour, minute = map(int, parts[1:5])
+                    return datetime(year, month, day, hour, minute)
+                if len(parts) >= 3:
+                    year = int(parts[0])
+                    if year < 100:
+                        year += 2000
+                    month, day = map(int, parts[1:3])
+                    return datetime(year, month, day, 0, 0)
+        return None
+
+    def _get_bid_status(self, deadline_text, open_time_text):
+        now = datetime.now()
+        deadline = self._parse_datetime(deadline_text)
+        open_time = self._parse_datetime(open_time_text)
+
+        if deadline and now < deadline:
+            return "투찰대기"
+        if open_time and now < open_time:
+            return "투찰완료"
+        if open_time and now >= open_time:
+            return "결과확인"
+        return "투찰대기"
+
+    def _clean_amount(self, text):
+        """금액 텍스트에서 숫자만 추출 (한글, 특수문자 제거 및 소수점 처리)"""
+        if not text: return ""
+        
+        # 1. 콤마 제거 및 공백 정리
+        text = text.replace(",", "").strip()
+        
+        # 2. 숫자(및 소수점)가 포함된 첫 번째 덩어리 추출
+        # 예: "금700354000(금칠억...)" -> "700354000"
+        # 예: "691239000[추정가격...]" -> "691239000"
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        if match:
+            val = match.group(1)
+            # 3. 소수점이 있는 경우 (.00 등) 정수화
+            if "." in val:
+                try:
+                    val = str(int(float(val)))
+                except:
+                    val = val.split(".")[0]
+            return val
+        
+        # 4. 만약 위에서 못 찾았다면 모든 숫자만 강제로 합치기 (최후의 수단)
+        # 단, 괄호 안의 숫자가 섞일 위험이 있으므로 위 방식이 우선임
+        digits = re.sub(r"[^0-9]", "", text)
+        return digits if digits else ""
+
+    def _parse_float(self, text):
+        """텍스트에서 숫자(실수 포함)만 추출하여 float로 반환"""
+        if not text: return None
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        try:
+            return float(match.group(1)) if match else None
+        except: return None
+
+    def _find_summary_value(self, label):
+        """페이지 내에서 라벨 옆의 값을 찾습니다 (테이블 구조 우선)"""
+        try:
+            xpath = f"//th[contains(., '{label}')]/following-sibling::td[1] | //td[contains(., '{label}')]/following-sibling::td[1]"
+            elements = self.driver.find_elements(By.XPATH, xpath)
+            for elem in elements:
+                text = elem.text.strip()
+                if text: return text
+            
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            pattern = rf"{re.escape(label)}\s*[:：]?\s*([0-9]+[.,]?[0-9]*\s*%?)"
+            match = re.search(pattern, body_text)
+            return match.group(1).strip() if match else ""
+        except: return ""
+
+    def _parse_result_table(self):
+        """낙찰순위 테이블에서 행 및 헤더를 추출합니다."""
+        try:
+            # 1. 다양한 XPath 패턴으로 테이블 찾기
+            table = None
+            xpath_patterns = [
+                "//div[contains(., '낙찰순위')]//table[1]",
+                "//table[.//th[contains(., '순위')] and .//th[contains(., '상호명')]]",
+                "//table[.//th[contains(., '순위')] and .//th[contains(., '투찰률')]]",
+                "//table[@class='table' or @class='tbl']//tr[.//th]",
+                "//div[@id='listBody1']//table",
+                "//div[contains(@class, 'list')]//table"
+            ]
+            
+            for xpath in xpath_patterns:
+                try:
+                    table = self.driver.find_element(By.XPATH, xpath)
+                    if table:
+                        break
+                except:
+                    continue
+            
+            if not table:
+                print("⚠️ 낙찰순위 테이블을 찾을 수 없습니다.")
+                return None, []
+            
+            # 2. 헤더 추출
+            headers = []
+            try:
+                header_cells = table.find_elements(By.XPATH, ".//th")
+                headers = [h.text.strip() for h in header_cells]
+            except:
+                # th가 없으면 첫 번째 tr을 헤더로 간주
+                try:
+                    first_row = table.find_element(By.XPATH, ".//tr[1]")
+                    cells = first_row.find_elements(By.XPATH, ".//td | .//th")
+                    headers = [c.text.strip() for c in cells]
+                except:
+                    pass
+            
+            if not headers:
+                print("⚠️ 테이블 헤더를 추출할 수 없습니다.")
+                return None, []
+            
+            print(f"📋 테이블 헤더: {headers}")
+            
+            # 3. 행 데이터 추출
+            rows = []
+            try:
+                row_elements = table.find_elements(By.XPATH, ".//tr[td]")
+                for row_elem in row_elements:
+                    cells = [c.text.strip() for c in row_elem.find_elements(By.XPATH, ".//td")]
+                    if not cells:
+                        continue
+                    
+                    # 헤더 개수와 맞추기
+                    if len(cells) < len(headers):
+                        cells = cells + [""] * (len(headers) - len(cells))
+                    elif len(cells) > len(headers):
+                        cells = cells[:len(headers)]
+                    
+                    row_dict = {headers[i]: cells[i] for i in range(len(headers))}
+                    rows.append(row_dict)
+                    print(f"   행 {len(rows)}: {row_dict}")
+            except Exception as e:
+                print(f"⚠️ 테이블 행 추출 중 오류: {e}")
+            
+            print(f"✅ {len(rows)}개 행 추출 완료")
+            return headers, rows
+        
+        except Exception as e:
+            print(f"❌ 낙찰순위 테이블 파싱 오류: {e}")
+            return None, []
+    
+
+    def _get_company_result(self, company_name, headers, rows):
+        for row in rows:
+            for key, value in row.items():
+                if company_name in value:
+                    return row
+        return None
+
+    def _parse_result_details(self):
+        """결과 페이지에서 두 투찰 회사 및 요약값을 추출합니다."""
+        headers, rows = self._parse_result_table()
+        result_data = {
+            "AIR 채호원 입찰금액": "", "AIR 채호원 순위": "",
+            "에어채호원 입찰금액": "", "에어채호원 순위": "",
+            "참여 업체수": "", "사정률": "",
+            "1등 업체사정률": "", "1등 상호명": ""
+        }
+
+        result_data["사정률"] = self._find_summary_value("사정률")
+        if "%" not in result_data["사정률"]:
+             val = self._find_summary_value("낙찰율")
+             if val: result_data["사정률"] = val
+
+        if not rows or not headers: return result_data
+        result_data["참여 업체수"] = str(len(rows))
+
+        # 콜럼 인덱스 분리 (카테고리별)
+        rank_idx = company_idx = bid_amount_idx = corp_rate_idx = -1
+        for i, h in enumerate(headers):
+            if "순위" in h:       rank_idx = i
+            if "상호" in h:       company_idx = i
+            if "입찰금액" in h:   bid_amount_idx = i
+            if "업체사정률" in h: corp_rate_idx = i
+
+        # 두 회사 이름 (공백 제거 후 비교)
+        company_air  = "AIR채호원"       # AIR 채호원
+        company_corp = "주식회사에어채호원"   # 주식회사 에어채호원
+
+        for idx, row in enumerate(rows):
+            row_vals = list(row.values())
+            # 1등 업체 정보
+            if idx == 0:
+                if corp_rate_idx != -1:
+                    result_data["1등 업체사정률"] = row_vals[corp_rate_idx]
+                if company_idx != -1:
+                    result_data["1등 상호명"] = row_vals[company_idx]
+            if company_idx == -1:
+                continue
+            name_clean = row_vals[company_idx].replace(" ", "")
+            if company_air in name_clean:
+                if rank_idx != -1:       result_data["AIR 채호원 순위"] = row_vals[rank_idx]
+                if bid_amount_idx != -1: result_data["AIR 채호원 입찰금액"] = row_vals[bid_amount_idx]
+            if company_corp in name_clean:
+                if rank_idx != -1:       result_data["에어채호원 순위"] = row_vals[rank_idx]
+                if bid_amount_idx != -1: result_data["에어채호원 입찰금액"] = row_vals[bid_amount_idx]
+        return result_data
+
+    def parse_all(self):
+        """상세 공고 정보 추출"""
+        bid_close_text = re.sub(r"투찰(?:하기)?", "", self.get_val("투찰마감일시")).strip()
+        open_time_text = self.get_val("입찰(개찰) 일시")
+        
+        # [수정] 개찰일시가 없는 경우 투찰마감일시 기준 +1시간 자동 설정
+        if not open_time_text or not re.search(r"\d", open_time_text):
+            deadline_dt = self._parse_datetime(bid_close_text)
+            if deadline_dt:
+                fallback_dt = deadline_dt + timedelta(hours=1)
+                open_time_text = fallback_dt.strftime("%Y-%m-%d %H:%M")
+                print(f"   ℹ️ 개찰일시 누락 → 투찰마감(+1h)으로 자동 설정: {open_time_text}")
+        
+        # 공고번호 추출 보강
+        bid_no = self.get_val("발주처 공고번호")
+        if not bid_no:
+            bid_no = self.get_val("공고번호") # 단순 '공고번호' 라벨 시도
+        
+        data = {
+            "투찰상태": self._get_bid_status(bid_close_text, open_time_text),
+            "공고번호": bid_no,
+            "공고명": "",
+            "지역제한": self.get_val("지역제한"),
+            "입찰개시일": self.get_val("입찰개시일"),
+            "투찰마감일시": bid_close_text,
+            "개찰일시": open_time_text,
+            "예상투찰가1": "",
+            "예상투찰가2": "",
+            "예상투찰가3": "",
+            "기초금액": self._clean_amount(self.get_val_base_price()),
+            "예가변동폭": self.get_val("예가변동폭"),
+            "투찰하한율": self.get_val("투찰하한율"),
+            "계약방법": self.get_val("계약방법")
+        }
+        
+        # [추가] 예상투찰가1 자동 계산 (기초금액 * 사정률 * 투찰하한율)
+        try:
+            base_val = float(data["기초금액"]) if data["기초금액"] else None
+            # 평균사정률 또는 사정률 라벨 탐색
+            rate_text = self.get_val("평균사정률") or self.get_val("사정률")
+            rate_val = self._parse_float(rate_text)
+            limit_val = self._parse_float(data["투찰하한율"])
+            
+            if base_val and rate_val and limit_val:
+                # 공식: 기초금액 * (사정률/100) * (하한율/100)
+                estimated = base_val * (rate_val / 100.0) * (limit_val / 100.0)
+                data["예상투찰가1"] = format(int(estimated), ',')
+                print(f"   💰 예상투찰가1 자동계산 완료: {data['예상투찰가1']} (사정률: {rate_val}%)")
+            else:
+                data["예상투찰가1"] = "-"
+        except Exception as e:
+            data["예상투찰가1"] = "-"
+            print(f"   ⚠️ 예상투찰가 계산 실패: {e}")
+        
+        try:
+            # JS를 사용해 DOM 조작으로 불필요한 태그(img 등) 제거 후 텍스트 추출
+            script = """
+                var elem = document.querySelector(arguments[0]);
+                if (!elem) return '';
+                var clone = elem.cloneNode(true);
+                // 1. img 태그(접두사 아이콘 등) 제거
+                var imgs = clone.querySelectorAll('img');
+                imgs.forEach(img => img.remove());
+                
+                // 2. 투찰마감 등 특정 텍스트를 가진 독립된 태그 제거
+                var els = clone.querySelectorAll('*');
+                var removeTexts = ['투찰마감', '결과확인', '투찰대기', '입찰마감', '투찰완료', '전', '긴', '결', '수', '취', '견', '재', '전자', '긴급', '취소', '과거 공고', '지난공고', '지나온공고'];
+                els.forEach(el => {
+                    if (removeTexts.includes(el.textContent.trim())) {
+                        el.remove();
+                    }
+                });
+                return clone.textContent;
+            """
+            raw_title = self.driver.execute_script(script, KbidConfig.SELECTORS["detail_title"])
+            
+            if "(취소)" in raw_title:
+                data["투찰상태"] = "공고 취소"
+                
+            clean_title = raw_title
+            # 텍스트로 섞여 있을 수 있는 상태값 제거
+            for word in ['투찰마감', '결과확인', '투찰대기', '입찰마감', '투찰완료']:
+                clean_title = clean_title.replace(word, "")
+                
+            # 괄호로 둘러싸인 접두사/접미사 제거
+            clean_title = re.sub(r'[\[\(<](?:긴|전|취|긴급|전자|취소|지난공고|지나온공고|공고|재공고|재공고입찰|견적)[\]\)>]', '', clean_title)
+            clean_title = clean_title.replace("(취소)", "").replace("(과거 공고)", "")
+            clean_title = clean_title.replace("(재공고)", "").replace("[재공고]", "").replace("<재공고입찰>", "").replace("(견적)", "")
+            
+            # 띄어쓰기가 있는 접두사 제거 (예: "전 긴 용인..." -> "용인...")
+            clean_title = re.sub(r'^(?:긴|전|취|급|수|결|견|재)\s+', '', clean_title).replace("복사", "")
+            
+            data["공고명"] = re.sub(r'\s+', ' ', clean_title).strip()
+        except: pass
+        return data
+
+class KbidCrawler:
+    """프로세스 통합 컨트롤러"""
+    def __init__(self):
+        try:
+            self.gs = GoogleSheetsManager()
+            self.browser = None
+            self.parser = None
+        except Exception as e:
+            print(f"❗ 초기화 오류: {e}")
+            exit()
+
+    def run(self):
+        try:
+            # 1. 투찰준비 시트의 상태를 최신화
+            updated_count = self.gs.update_bid_statuses()
+            if updated_count is not None:
+                print(f"⚙️ 투찰준비 시트 상태 확인 완료 ({updated_count}건 업데이트)")
+
+            # 2. 시트에서 공고 목록 및 이미 처리된 목록 로드
+            tasks = self.gs.get_search_terms()
+            processed_bids = self.gs.get_processed_bids()
+            
+            if not tasks:
+                print("📝 작업할 공고가 없습니다. 투찰준비 시트 상태를 먼저 확인했습니다.")
+                return
+
+            self.browser = KbidBrowser(self.gs)
+            self.parser = KbidParser(self.browser.driver)
+            
+            if not tasks:
+                print("📝 작업할 공고가 없습니다.")
+                return
+
+            # 2. 로그인 수행
+            if not self.browser.wait_for_login(): return
+
+            # 기초금액 누락 공고 목록 사전 조회 (시트에서 기초금액이 비어있는 공고번호 집합)
+            try:
+                ws_prepare = self.gs.sheet.worksheet("투찰준비")
+                headers_row = [h.replace("*", "").strip() for h in ws_prepare.row_values(1)]
+                base_price_col_idx = headers_row.index("기초금액") if "기초금액" in headers_row else -1
+                bid_no_col_idx = headers_row.index("공고번호") if "공고번호" in headers_row else 1
+                all_rows = ws_prepare.get_all_values()[1:]  # 헤더 제외
+                missing_base_price_bids = set()
+                for row in all_rows:
+                    bid_no_val = row[bid_no_col_idx].strip() if len(row) > bid_no_col_idx else ""
+                    base_price_val = row[base_price_col_idx].strip() if base_price_col_idx >= 0 and len(row) > base_price_col_idx else ""
+                    if bid_no_val and not base_price_val:
+                        missing_base_price_bids.add(bid_no_val)
+                if missing_base_price_bids:
+                    print(f"⚠️ 기초금액 누락 공고 {len(missing_base_price_bids)}건 재확인 예정: {missing_base_price_bids}")
+            except Exception as e:
+                print(f"⚠️ 기초금액 누락 조회 중 오류 (무시): {e}")
+                missing_base_price_bids = set()
+
+            # 3. 공고 순회 크롤링
+            for task in tasks:
+                try:
+                    name = task.get("name", "").strip()
+                    num = task.get("num", "").strip()
+                    display_name = num or name
+                    
+                    # 핵심 번호만 추출하여 중복 체크 (예: R26BK01488658-000)
+                    match = re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', num)
+                    clean_num = match.group() if match else num
+                    
+                    if clean_num and clean_num in processed_bids:
+                        # 기초금액이 누락된 경우에는 재크롤링 시도
+                        if clean_num in missing_base_price_bids:
+                            print(f"🔄 기초금액 누락으로 재크롤링: {clean_num}")
+                        else:
+                            print(f"⏩ 이미 시트에 있는 공고이므로 건너뜁니다: {clean_num}")
+                            continue
+
+                    print(f"\n🔍 작업 확인: {display_name}")
+                    
+                    # 상세 페이지 이동 (공고 정보 기반)
+                    if self.browser.navigate_to_bid(task):
+                        res_data = self.parser.parse_all()
+                        
+                        # 공고명은 입찰공고 시트의 원본 이름을 그대로 사용
+                        # (웹 스크랩 시 kbid 배지 텍스트(전, 긴, A 등)가 섞이는 문제 방지)
+                        if name:
+                            res_data["공고명"] = name
+                        
+                        bid_no = res_data.get("공고번호")
+                        
+                        # 항상 저장을 시도 (내부 로직에서 업데이트/추가 결정)
+                        if self.gs.save_result(res_data):
+                            print(f"   └─ 투찰상태: {res_data.get('투찰상태')}")
+                            if res_data.get('AIR 채호원 순위'):
+                                print(f"   └─ AIR 채호원: {res_data.get('AIR 채호원 순위')}위 / {res_data.get('AIR 채호원 입찰금액')}")
+                            if res_data.get('에어채호원 순위'):
+                                print(f"   └─ 에어채호원: {res_data.get('에어채호원 순위')}위 / {res_data.get('에어채호원 입찰금액')}")  
+                            if res_data.get('1등 상호명'):
+                                print(f"   └─ 1등: {res_data.get('1등 상호명')} / 업체사정률 {res_data.get('1등 업체사정률')}")
+                        
+                        # 상세 페이지(새 창) 닫기
+                        if len(self.browser.driver.window_handles) > 1:
+                            self.browser.driver.close()
+                            self.browser.driver.switch_to.window(self.browser.driver.window_handles[0])
+                    else:
+                        print(f"❌ 공고를 찾을 수 없음: {display_name}")
+                        # 확인불가 상태로 시트에 기록
+                        fail_data = {
+                            "투찰상태": "확인불가",
+                            "공고번호": clean_num or num,
+                            "공고명": name,
+                        }
+                        self.gs.save_result(fail_data)
+                        print(f"   └─ '투찰준비' 시트에 '확인불가'로 기록했습니다.")
+                except Exception as e:
+                    print(f"❗ '{display_name}' 처리 중 예상치 못한 에러 발생: {e}")
+                    traceback.print_exc()
+                
+                time.sleep(0.3)
+        except Exception as e:
+            print(f"🛑 프로그램 실행 중 치명적 오류 발생")
+            traceback.print_exc()
+        finally:
+            if self.browser is not None:
+                try:
+                    self.browser.driver.quit()
+                except Exception:
+                    pass
+            print("\n🏁 모든 작업을 마쳤습니다.")
+
+if __name__ == "__main__":
+    KbidCrawler().run()
