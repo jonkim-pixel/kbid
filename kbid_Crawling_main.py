@@ -21,6 +21,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import UnexpectedAlertPresentException, TimeoutException
 
 class KbidConfig:
     """설정값 및 셀렉터 관리"""
@@ -85,9 +86,9 @@ class GoogleSheetsManager:
                 "투찰상태", "공고번호", "공고명", "지역제한", "입찰개시일", "투찰마감일시", "개찰일시",
                 "기초금액", "예가변동폭", "투찰하한율", "계약방법",
                 "예상투찰가1", "예상투찰가2", "예상투찰가3",
-                "AIR 채호원 입찰금액", "AIR 채호원 순위",
-                "에어채호원 입찰금액", "에어채호원 순위",
-                "참여 업체수", "사정률", "1등 업체사정률", "1등 상호명"
+                "참여 업체수", "사정률", "1등 상호명", "1등 업체 입찰금액", "1등 업체 사정률",
+                "AIR 채호원 입찰금액", "AIR 채호원 사정률", "AIR 채호원 순위",
+                "에어채호원 입찰금액", "에어채호원 사정률", "에어채호원 순위"
             ]
             ws_prepare.append_row(headers)
         except: pass
@@ -110,9 +111,9 @@ class GoogleSheetsManager:
             "투찰상태", "공고번호", "공고명", "지역제한", "입찰개시일", "투찰마감일시", "개찰일시",
             "기초금액", "예가변동폭", "투찰하한율", "계약방법",
             "예상투찰가1", "예상투찰가2", "예상투찰가3",
-            "AIR 채호원 입찰금액", "AIR 채호원 순위",
-            "에어채호원 입찰금액", "에어채호원 순위",
-            "참여 업체수", "사정률", "1등 업체사정률", "1등 상호명"
+            "참여 업체수", "사정률", "1등 상호명", "1등 업체 입찰금액", "1등 업체 사정률",
+            "AIR 채호원 입찰금액", "AIR 채호원 사정률", "AIR 채호원 순위",
+            "에어채호원 입찰금액", "에어채호원 사정률", "에어채호원 순위"
         ]
 
         current_headers = [h.replace("*", "").strip() for h in ws.row_values(1)]
@@ -380,22 +381,25 @@ class KbidBrowser:
                 # 로그인 요소들 확인 (예: 로그아웃 버튼 등)
                 for selector in KbidConfig.SELECTORS["login_check"]:
                     try:
-                        self.driver.find_element(By.XPATH, selector)
-                        print("✅ 로그인 확인되었습니다.")
-                        time.sleep(0.5)
-                        return True
-                    except:
-                        pass
+                        if self.driver.find_elements(By.XPATH, selector):
+                            print("✅ 로그인 확인되었습니다.")
+                            return True
+                    except: continue
                 
-                # 진행 상태 표시
-                remaining = int(timeout - (time.time() - start_time))
-                if remaining % 10 == 0:
-                    print(f"⏳ 로그인 대기 중... (남은 시간: {remaining}초)")
-                
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"⚠️ 로그인 감지 중 오류: {e}")
-                time.sleep(0.5)
+                time.sleep(2)
+            except UnexpectedAlertPresentException as e:
+                alert_text = str(e.alert_text) if e.alert_text else "알 수 없는 알림"
+                print(f"\n⚠️ 알림 발생: {alert_text}")
+                print("   [안내] 브라우저에서 알림창의 '확인' 버튼을 클릭해 주세요. 그 후 작업을 계속합니다.")
+                while True:
+                    try:
+                        time.sleep(2)
+                        self.driver.title
+                        break
+                    except UnexpectedAlertPresentException: continue
+                    except: break
+            except Exception:
+                time.sleep(2)
         
         print("❌ 로그인 감지 실패 (시간 초과)")
         return False
@@ -948,10 +952,10 @@ class KbidParser:
         """결과 페이지에서 두 투찰 회사 및 요약값을 추출합니다."""
         headers, rows = self._parse_result_table()
         result_data = {
-            "AIR 채호원 입찰금액": "", "AIR 채호원 순위": "",
-            "에어채호원 입찰금액": "", "에어채호원 순위": "",
-            "참여 업체수": "", "사정률": "",
-            "1등 업체사정률": "", "1등 상호명": ""
+            "참여 업체수": "", "사정률": "", "1등 상호명": "",
+            "1등 업체 입찰금액": "", "1등 업체 사정률": "",
+            "AIR 채호원 입찰금액": "", "AIR 채호원 사정률": "", "AIR 채호원 순위": "", 
+            "에어채호원 입찰금액": "", "에어채호원 사정률": "", "에어채호원 순위": "",
         }
 
         result_data["사정률"] = self._find_summary_value("사정률")
@@ -968,7 +972,7 @@ class KbidParser:
             if "순위" in h:       rank_idx = i
             if "상호" in h:       company_idx = i
             if "입찰금액" in h:   bid_amount_idx = i
-            if "업체사정률" in h: corp_rate_idx = i
+            if "사정률" in h and ("업체" in h or "사정률" in h): corp_rate_idx = i
 
         # 두 회사 이름 (공백 제거 후 비교)
         company_air  = "AIR채호원"       # AIR 채호원
@@ -976,10 +980,11 @@ class KbidParser:
 
         for idx, row in enumerate(rows):
             row_vals = list(row.values())
-            # 1등 업체 정보
             if idx == 0:
                 if corp_rate_idx != -1:
-                    result_data["1등 업체사정률"] = row_vals[corp_rate_idx]
+                    result_data["1등 업체 사정률"] = row_vals[corp_rate_idx]
+                if bid_amount_idx != -1:
+                    result_data["1등 업체 입찰금액"] = row_vals[bid_amount_idx]
                 if company_idx != -1:
                     result_data["1등 상호명"] = row_vals[company_idx]
             if company_idx == -1:
@@ -988,9 +993,11 @@ class KbidParser:
             if company_air in name_clean:
                 if rank_idx != -1:       result_data["AIR 채호원 순위"] = row_vals[rank_idx]
                 if bid_amount_idx != -1: result_data["AIR 채호원 입찰금액"] = row_vals[bid_amount_idx]
+                if corp_rate_idx != -1:  result_data["AIR 채호원 사정률"] = row_vals[corp_rate_idx]
             if company_corp in name_clean:
                 if rank_idx != -1:       result_data["에어채호원 순위"] = row_vals[rank_idx]
                 if bid_amount_idx != -1: result_data["에어채호원 입찰금액"] = row_vals[bid_amount_idx]
+                if corp_rate_idx != -1:  result_data["에어채호원 사정률"] = row_vals[corp_rate_idx]
         return result_data
 
     def parse_all(self):
