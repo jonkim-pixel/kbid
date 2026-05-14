@@ -296,6 +296,29 @@ class KbidParser:
     def __init__(self, driver):
         self.driver = driver
 
+    def _format_amount(self, text):
+        """금액 텍스트에서 숫자만 추출하여 1,000 단위 표시 (원 제거)"""
+        if not text: return text
+        if text == "-": return text
+        
+        # 1. 숫자만 추출 (콤마, 한글, 특수문자 제거)
+        digits = re.sub(r"[^0-9]", "", str(text))
+        
+        if not digits: return text
+        
+        try:
+            # 2. 정수로 변환 후 콤마 추가
+            val = int(digits)
+            return format(val, ',')
+        except:
+            return text
+
+    def _format_rate(self, text):
+        """사정률 등에서 % 제거"""
+        if not text: return text
+        if text == "-": return text
+        return str(text).replace("%", "").strip()
+
     def verify_result_page(self):
         """'개찰결과' 화면인지 확인하고 필요시 탭 클릭"""
         # 디버깅용: 상세 페이지 소스 저장
@@ -340,12 +363,12 @@ class KbidParser:
         data = {
             "참여 업체수": "", "사정률": "", "1등 상호명": "",
             "1등 업체 입찰금액": "", "1등 업체 사정률": "",
-            "AIR 채호원 입찰금액": "", "AIR 채호원 사정률": "", "AIR 채호원 순위": "",
-            "에어채호원 입찰금액": "", "에어채호원 사정률": "", "에어채호원 순위": ""
+            "AIR 채호원 입찰금액": "-", "AIR 채호원 사정률": "-", "AIR 채호원 순위": "-",
+            "에어채호원 입찰금액": "-", "에어채호원 사정률": "-", "에어채호원 순위": "-"
         }
         
         # 요약 정보 (참여 업체수, 사정률)
-        data["사정률"] = self._find_text_by_label("사정률") or self._find_text_by_label("낙찰율")
+        data["사정률"] = self._format_rate(self._find_text_by_label("사정률") or self._find_text_by_label("낙찰율"))
         
         # 1. 참여 업체수 파싱
         try:
@@ -361,8 +384,8 @@ class KbidParser:
         if rows:
             first_row = rows[0]
             data["1등 상호명"] = self._get_cell(first_row, headers, "상호")
-            data["1등 업체 입찰금액"] = self._get_cell(first_row, headers, "입찰금액")
-            data["1등 업체 사정률"] = self._get_cell(first_row, headers, "사정률")
+            data["1등 업체 입찰금액"] = self._format_amount(self._get_cell(first_row, headers, "입찰금액"))
+            data["1등 업체 사정률"] = self._format_rate(self._get_cell(first_row, headers, "사정률"))
 
         # 3. 채호원 검색 (AIR/에어 정보 추출용)
         self._search_and_parse_target_companies(data)
@@ -390,13 +413,13 @@ class KbidParser:
             for row in rows:
                 name = self._get_cell(row, headers, "상호").replace(" ", "")
                 if "AIR채호원" in name and not found_air:
-                    data["AIR 채호원 입찰금액"] = self._get_cell(row, headers, "입찰금액")
-                    data["AIR 채호원 사정률"] = self._get_cell(row, headers, "사정률")
+                    data["AIR 채호원 입찰금액"] = self._format_amount(self._get_cell(row, headers, "입찰금액"))
+                    data["AIR 채호원 사정률"] = self._format_rate(self._get_cell(row, headers, "사정률"))
                     data["AIR 채호원 순위"] = self._get_cell(row, headers, "순위")
                     found_air = True
-                if "에어채호원" in name and not found_corp:
-                    data["에어채호원 입찰금액"] = self._get_cell(row, headers, "입찰금액")
-                    data["에어채호원 사정률"] = self._get_cell(row, headers, "사정률")
+                if ("에어채호원" in name or "애어체호원" in name) and not found_corp:
+                    data["에어채호원 입찰금액"] = self._format_amount(self._get_cell(row, headers, "입찰금액"))
+                    data["에어채호원 사정률"] = self._format_rate(self._get_cell(row, headers, "사정률"))
                     data["에어채호원 순위"] = self._get_cell(row, headers, "순위")
                     found_corp = True
                 if found_air and found_corp: break
@@ -490,7 +513,7 @@ class KbidResultCrawler:
                         
                         # 가이드라인: 모든 페이지를 확인했으나 대상 업체가 없다면 '확인불가'로 처리
                         # (단, 1등 정보는 수집된 상태일 수 있음)
-                        if not result_data.get("AIR 채호원 순위") and not result_data.get("에어채호원 순위"):
+                        if result_data.get("AIR 채호원 순위") == "-" and result_data.get("에어채호원 순위") == "-":
                             print("⚠️ 대상 업체를 찾을 수 없어 '확인불가'로 설정합니다.")
                             result_data["투찰상태"] = "확인불가"
                         else:

@@ -333,8 +333,10 @@ class KbidBrowser:
     def _init_driver(self):
         options = Options()
         options.add_argument("--incognito")
-        options.page_load_strategy = 'eager'  # DOM만 로드되면 즉시 진행 (이미지/광고 대기 방지)
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_argument("--log-level=3")  # 크롬 내부 로그(GCM 등) 억제
+        options.add_argument("--disable-logging")
+        options.page_load_strategy = 'normal'  # 'eager' 대신 'normal' 사용하되 타임아웃 관리
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option('useAutomationExtension', False)
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0')
@@ -352,8 +354,13 @@ class KbidBrowser:
     def wait_for_login(self):
         """수동 로그인 대기 (현재 상태 확인 후 필요시 대기)"""
         # 먼저 검색 페이지로 시도 (이미 로그인되었으면 접근 가능)
-        self.driver.get(KbidConfig.SEARCH_URL_TEMPLATE.format(""))
-        time.sleep(0.5)
+        try:
+            self.driver.set_page_load_timeout(15)
+            self.driver.get(KbidConfig.SEARCH_URL_TEMPLATE.format(""))
+            time.sleep(1.0)
+        except:
+            try: self.driver.execute_script("window.stop();")
+            except: pass
         
         current_url = self.driver.current_url.lower()
         
@@ -409,9 +416,9 @@ class KbidBrowser:
         name = task.get("name", "")
         raw_num = task.get("num", "")
         
-        # 핵심 번호만 추출 (예: R26BK01488658-000)
-        # 문자열 내에서 영문+숫자+하이픈 조합의 긴 패턴을 찾음
-        match = re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', raw_num)
+        # 핵심 번호만 추출 (예: R26BK01488658-000, 202604021057-00)
+        # 문자열 내에서 영문+숫자+하이픈 조합의 패턴을 찾음
+        match = re.search(r'[A-Z0-9]{4,}-[A-Z0-9]+', raw_num)
         clean_num = match.group() if match else raw_num.strip()
         
         # 검색어 결정: 공고번호를 우선 사용 (공고명 검색 실패 시)
@@ -437,12 +444,51 @@ class KbidBrowser:
             
         time.sleep(0.5)
         
-        # 로그인 페이지로 튕겼는지 확인
-        if "login" in self.driver.current_url.lower():
+        # 로그인 페이지로 튕겼는지 확인 (URL 또는 페이지 내용 확인)
+        current_url = self.driver.current_url.lower()
+        is_login_page = "login" in current_url
+        
+        # URL에 login이 없어도 로그인 폼(MemID 필드)이 보이면 로그인 페이지로 간주 (KBID 마스킹 대응)
+        if not is_login_page:
+            try:
+                mem_id_elements = self.driver.find_elements(By.ID, "MemID")
+                if mem_id_elements and mem_id_elements[0].is_displayed():
+                    is_login_page = True
+            except: pass
+            
+        if is_login_page:
             print("   ⚠️ 세션 만료 또는 로그아웃 감지 - 재로그인 대기")
             if not self.wait_for_login(): return False
-            self.driver.get(url)
-            time.sleep(1)
+            
+            # 로그인 성공 후 바로 검색어로 이동 시도
+            try:
+                # 1안: 검색창에 직접 입력 (wait_for_login이 이미 검색 페이지에 있을 것이므로 바로 입력 시도)
+                time.sleep(1)
+                search_inputs = self.driver.find_elements(By.ID, "s_search_word")
+                if search_inputs:
+                    search_input = search_inputs[0]
+                    search_input.clear()
+                    search_input.send_keys(search_term_raw)
+                    time.sleep(0.3)
+                    # 검색 버튼 클릭 또는 엔터
+                    search_btn_elements = self.driver.find_elements(By.ID, "search_btn")
+                    if search_btn_elements:
+                        self.driver.execute_script("arguments[0].click();", search_btn_elements[0])
+                    else:
+                        search_input.send_keys("\n")
+                    print(f"   [디버그] 로그인 확인 후 직접 입력 방식으로 검색 진행")
+                else:
+                    # 검색창이 안 보이면 URL 직접 이동 (타임아웃 적용)
+                    self.driver.set_page_load_timeout(15)
+                    self.driver.get(url)
+            except:
+                try:
+                    self.driver.set_page_load_timeout(15)
+                    self.driver.get(url)
+                except:
+                    try: self.driver.execute_script("window.stop();")
+                    except: pass
+            time.sleep(1.5)
 
         try:
             print(f"   [디버그] 현재 창 개수: {len(self.driver.window_handles)}", flush=True)
@@ -479,21 +525,29 @@ class KbidBrowser:
                 try:
                     by_type = By.XPATH if selector.startswith("/") or selector.startswith("(") else By.CSS_SELECTOR
                     
-                    # 1. 메인 프레임 확인
+                    # 1. 메인 프레임 확인 (KBID 검색 결과는 대부분 메인 프레임에 있음)
                     self.driver.switch_to.default_content()
                     elements = self.driver.find_elements(by_type, selector)
                     if elements: return elements
                     
-                    # 2. 아이프레임 및 프레임 탐색 (단일 레벨만 확인하여 지연 방지)
+                    # 만약 현재 페이지가 로그인 페이지라면 프레임 탐색은 무의미함
+                    try:
+                        page_source_start = self.driver.page_source[:2000]
+                        if "MemID" in page_source_start or "FLogin" in page_source_start:
+                            return []
+                    except: pass
+
+                    # 2. 아이프레임 및 프레임 탐색 (최소한으로 제한하여 지연 방지)
                     all_frames = self.driver.find_elements(By.XPATH, "//iframe | //frame")
+                    # 너무 많은 프레임(광고 등)이 있는 경우 상위 몇 개만 확인
+                    if len(all_frames) > 5:
+                        all_frames = all_frames[:5]
+                        
                     for f in all_frames:
                         try:
-                            # 프레임 전환
                             self.driver.switch_to.frame(f)
-                            # 해당 프레임에서 요소 찾기
                             elements = self.driver.find_elements(by_type, selector)
                             if elements: return elements
-                            # 못 찾았으면 상위로 복귀
                             self.driver.switch_to.default_content()
                         except:
                             try: self.driver.switch_to.default_content()
@@ -514,12 +568,23 @@ class KbidBrowser:
             
             # 1단계: 페이지 로드 및 AJAX 테이블 확인
             print(f"⏳ 페이지 로드 및 데이터 수집 대기 중 (키워드: {search_term_raw[:20]}...)...")
+            
             table_found = False
-            for i in range(5): # 최대 5초간 테이블 컨테이너 확인
+            for i in range(7): # 최대 7초간 테이블 컨테이너 확인
                 # KBID 검색 결과 테이블 ID: idCBidTable
                 if find_in_frames("#idCBidTable, .tbl_search_list, #listBody1"):
                     table_found = True
                     break
+                
+                # 중간에 로그인 페이지로 변했는지 재확인
+                if i == 3:
+                    try:
+                        if "MemID" in self.driver.page_source:
+                            print("   ⚠️ 로딩 중 로그인 페이지 감지 - 재로그인 대기")
+                            if not self.wait_for_login(): return False
+                            self.driver.get(url)
+                    except: pass
+                
                 time.sleep(1)
             
             if not table_found:
@@ -544,8 +609,8 @@ class KbidBrowser:
                             for r in rows:
                                 try:
                                     txt = r.get_attribute("innerText") or ""
-                                    # 공고번호 패턴이 있는지 확인
-                                    if re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', txt) or re.search(r'\d{10}-\d{2}', txt):
+                                    # 공고번호 패턴이 있는지 확인 (유연하게: 8자리 이상 숫자 또는 영숫자-영숫자 조합)
+                                    if re.search(r'[A-Z0-9]{4,}-[A-Z0-9]+', txt) or re.search(r'\d{8,}', txt):
                                         real.append(r)
                                 except: continue
                             if real:
@@ -559,6 +624,12 @@ class KbidBrowser:
                 
                 # 아직 데이터가 없으면 잠시 대기
                 if wait_step % 2 == 0:
+                    # '결과가 없습니다' 메시지 확인 (조기 종료)
+                    try:
+                        if "결과가 없습니다" in self.driver.page_source:
+                            print("   ℹ️ 검색 결과가 없습니다.")
+                            break
+                    except: pass
                     print(f"   ...데이터 기다리는 중 ({wait_step+1}s)")
                 time.sleep(1)
 
@@ -572,7 +643,7 @@ class KbidBrowser:
                     for r in rows:
                         try:
                             txt = r.text
-                            if re.search(r'[A-Z0-9]{5,}-[A-Z0-9]+', txt) or re.search(r'\d{10}-\d{2}', txt):
+                            if re.search(r'[A-Z0-9]{4,}-[A-Z0-9]+', txt) or re.search(r'\d{8,}', txt):
                                 if r.find_elements(By.TAG_NAME, "a"):
                                     real.append(r)
                         except: continue
@@ -605,21 +676,31 @@ class KbidBrowser:
 
                 is_match = False
                 if clean_num and clean_num in row_text:
+                    print(f"      [매칭] 공고번호 일치: {clean_num}")
                     is_match = True
                 elif short_name and short_name in row_text:
+                    print(f"      [매칭] 공고명 부분 일치: {short_name}")
                     is_match = True
-                elif name_only_ko[:8] in row_text_ko:
+                elif name_only_ko[:8] and name_only_ko[:8] in row_text_ko:
+                    print(f"      [매칭] 공고명(한글) 유사 일치: {name_only_ko[:8]}")
                     is_match = True
+                else:
+                    # 아주 짧은 매칭 시도 (실패 가능성 높음)
+                    if name_only_ko[:5] and name_only_ko[:5] in row_text_ko:
+                         print(f"      [매칭] 공고명(한글) 최소 일치 시도: {name_only_ko[:5]}")
+                         is_match = True
 
                 if is_match:
-                    print(f"   🔎 매칭 후보: {row_text[:60]}...")
+                    print(f"   🔎 매칭 후보 발견: {row_text[:60]}...")
                     
                     is_canceled = (
                         "(취소)" in row_text
                         or 'alt="취"' in row_html
                         or 'alt="결"' in row_html
+                        or "공고취소" in row_text.replace(" ", "")
                     )
                     if is_canceled:
+                        print("      → 취소/마감된 공고입니다.")
                         if cancel_row is None: cancel_row = row
                         continue
                     target_row = row
@@ -817,31 +898,26 @@ class KbidParser:
             return "결과확인"
         return "투찰대기"
 
-    def _clean_amount(self, text):
-        """금액 텍스트에서 숫자만 추출 (한글, 특수문자 제거 및 소수점 처리)"""
+    def _format_amount(self, text):
+        """금액 텍스트에서 숫자만 추출하여 1,000 단위 표시 (원 제거)"""
         if not text: return ""
         
-        # 1. 콤마 제거 및 공백 정리
-        text = text.replace(",", "").strip()
+        # 1. 숫자만 추출 (콤마, 한글, 특수문자 제거)
+        digits = re.sub(r"[^0-9]", "", str(text))
         
-        # 2. 숫자(및 소수점)가 포함된 첫 번째 덩어리 추출
-        # 예: "금700354000(금칠억...)" -> "700354000"
-        # 예: "691239000[추정가격...]" -> "691239000"
-        match = re.search(r"(\d+(?:\.\d+)?)", text)
-        if match:
-            val = match.group(1)
-            # 3. 소수점이 있는 경우 (.00 등) 정수화
-            if "." in val:
-                try:
-                    val = str(int(float(val)))
-                except:
-                    val = val.split(".")[0]
-            return val
+        if not digits: return ""
         
-        # 4. 만약 위에서 못 찾았다면 모든 숫자만 강제로 합치기 (최후의 수단)
-        # 단, 괄호 안의 숫자가 섞일 위험이 있으므로 위 방식이 우선임
-        digits = re.sub(r"[^0-9]", "", text)
-        return digits if digits else ""
+        try:
+            # 2. 정수로 변환 후 콤마 추가
+            val = int(digits)
+            return format(val, ',')
+        except:
+            return digits
+
+    def _format_rate(self, text):
+        """사정률 등에서 % 제거"""
+        if not text: return ""
+        return str(text).replace("%", "").strip()
 
     def _parse_float(self, text):
         """텍스트에서 숫자(실수 포함)만 추출하여 float로 반환"""
@@ -958,10 +1034,10 @@ class KbidParser:
             "에어채호원 입찰금액": "", "에어채호원 사정률": "", "에어채호원 순위": "",
         }
 
-        result_data["사정률"] = self._find_summary_value("사정률")
-        if "%" not in result_data["사정률"]:
+        result_data["사정률"] = self._format_rate(self._find_summary_value("사정률"))
+        if not result_data["사정률"]:
              val = self._find_summary_value("낙찰율")
-             if val: result_data["사정률"] = val
+             if val: result_data["사정률"] = self._format_rate(val)
 
         if not rows or not headers: return result_data
         result_data["참여 업체수"] = str(len(rows))
@@ -982,9 +1058,9 @@ class KbidParser:
             row_vals = list(row.values())
             if idx == 0:
                 if corp_rate_idx != -1:
-                    result_data["1등 업체 사정률"] = row_vals[corp_rate_idx]
+                    result_data["1등 업체 사정률"] = self._format_rate(row_vals[corp_rate_idx])
                 if bid_amount_idx != -1:
-                    result_data["1등 업체 입찰금액"] = row_vals[bid_amount_idx]
+                    result_data["1등 업체 입찰금액"] = self._format_amount(row_vals[bid_amount_idx])
                 if company_idx != -1:
                     result_data["1등 상호명"] = row_vals[company_idx]
             if company_idx == -1:
@@ -992,12 +1068,12 @@ class KbidParser:
             name_clean = row_vals[company_idx].replace(" ", "")
             if company_air in name_clean:
                 if rank_idx != -1:       result_data["AIR 채호원 순위"] = row_vals[rank_idx]
-                if bid_amount_idx != -1: result_data["AIR 채호원 입찰금액"] = row_vals[bid_amount_idx]
-                if corp_rate_idx != -1:  result_data["AIR 채호원 사정률"] = row_vals[corp_rate_idx]
+                if bid_amount_idx != -1: result_data["AIR 채호원 입찰금액"] = self._format_amount(row_vals[bid_amount_idx])
+                if corp_rate_idx != -1:  result_data["AIR 채호원 사정률"] = self._format_rate(row_vals[corp_rate_idx])
             if company_corp in name_clean:
                 if rank_idx != -1:       result_data["에어채호원 순위"] = row_vals[rank_idx]
-                if bid_amount_idx != -1: result_data["에어채호원 입찰금액"] = row_vals[bid_amount_idx]
-                if corp_rate_idx != -1:  result_data["에어채호원 사정률"] = row_vals[corp_rate_idx]
+                if bid_amount_idx != -1: result_data["에어채호원 입찰금액"] = self._format_amount(row_vals[bid_amount_idx])
+                if corp_rate_idx != -1:  result_data["에어채호원 사정률"] = self._format_rate(row_vals[corp_rate_idx])
         return result_data
 
     def parse_all(self):
@@ -1029,7 +1105,7 @@ class KbidParser:
             "예상투찰가1": "",
             "예상투찰가2": "",
             "예상투찰가3": "",
-            "기초금액": self._clean_amount(self.get_val_base_price()),
+            "기초금액": self._format_amount(self.get_val_base_price()),
             "예가변동폭": self.get_val("예가변동폭"),
             "투찰하한율": self.get_val("투찰하한율"),
             "계약방법": self.get_val("계약방법")
@@ -1037,7 +1113,9 @@ class KbidParser:
         
         # [추가] 예상투찰가1 자동 계산 (기초금액 * 사정률 * 투찰하한율)
         try:
-            base_val = float(data["기초금액"]) if data["기초금액"] else None
+            # 콤마 제거 후 float 변환
+            clean_base = data["기초금액"].replace(",", "") if data["기초금액"] else ""
+            base_val = float(clean_base) if clean_base else None
             # 평균사정률 또는 사정률 라벨 탐색
             rate_text = self.get_val("평균사정률") or self.get_val("사정률")
             rate_val = self._parse_float(rate_text)
