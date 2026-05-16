@@ -15,7 +15,7 @@ import os
 import gspread
 import traceback
 from datetime import datetime, timedelta
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -382,7 +382,7 @@ class KbidBrowser:
                 current_url = self.driver.current_url.lower()
                 if "login" not in current_url:
                     print("✅ 로그인 확인되었습니다.")
-                    time.sleep(0.5)
+                    time.sleep(2.0) # 안정화를 위해 대기 시간 증가
                     return True
                 
                 # 로그인 요소들 확인 (예: 로그아웃 버튼 등)
@@ -390,6 +390,7 @@ class KbidBrowser:
                     try:
                         if self.driver.find_elements(By.XPATH, selector):
                             print("✅ 로그인 확인되었습니다.")
+                            time.sleep(2.0) # 안정화를 위해 대기 시간 증가
                             return True
                     except: continue
                 
@@ -430,19 +431,25 @@ class KbidBrowser:
             search_term_raw = re.sub(r'^[\(\[\{]\s*[^\)\]\}]+\s*[\)\]\}]\s*', '', search_term_raw).strip()
         
         search_term = quote_plus(search_term_raw)
+        # URL 결정 및 로그 출력
         url = KbidConfig.SEARCH_URL_TEMPLATE.format(search_term)
         print(f"   [디버그] 페이지 이동 시도: {url}")
         
-        # 페이지 로드 타임아웃 및 전략 설정
+        # [최적화] 현재 URL이 이미 검색 결과 URL과 일치하는지 확인 (중복 로드 방지)
         try:
-            self.driver.set_page_load_timeout(20)
-            self.driver.get(url)
+            # 특수문자 인코딩 차이 등으로 인해 단순 비교가 어려울 수 있으므로 검색어 포함 여부로 판단
+            decoded_current_url = unquote(self.driver.current_url)
+            if search_term_raw in decoded_current_url and "search/index.htm" in decoded_current_url:
+                print("   [디버그] 이미 해당 검색 결과 페이지에 있습니다. 이동을 생략합니다.")
+            else:
+                self.driver.set_page_load_timeout(20)
+                self.driver.get(url)
         except Exception as e:
             print(f"   ⚠️ 페이지 로드 시간 초과 또는 오류 (무시하고 진행): {e}")
             try: self.driver.execute_script("window.stop();")
             except: pass
             
-        time.sleep(0.5)
+        time.sleep(1.0) # 페이지 안정화 대기 시간 약간 증가
         
         # 로그인 페이지로 튕겼는지 확인 (URL 또는 페이지 내용 확인)
         current_url = self.driver.current_url.lower()
@@ -518,10 +525,10 @@ class KbidBrowser:
                 self.driver.get(url)
                 time.sleep(1)
 
-            # 탐색 함수: 메인 프레임에서만 찾기
+            # 탐색 함수: 메인 프레임 우선 탐색 및 선택적 프레임 탐색
             # (kbid.co.kr 검색 결과는 항상 메인 프레임에 있으며,
             #  광고/추적 iframe 순회가 120초 타임아웃을 유발했던 핵심 원인)
-            def find_in_frames(selector):
+            def find_in_frames(selector, search_frames=False):
                 try:
                     by_type = By.XPATH if selector.startswith("/") or selector.startswith("(") else By.CSS_SELECTOR
                     
@@ -530,18 +537,14 @@ class KbidBrowser:
                     elements = self.driver.find_elements(by_type, selector)
                     if elements: return elements
                     
-                    # 만약 현재 페이지가 로그인 페이지라면 프레임 탐색은 무의미함
-                    try:
-                        page_source_start = self.driver.page_source[:2000]
-                        if "MemID" in page_source_start or "FLogin" in page_source_start:
-                            return []
-                    except: pass
+                    # 프레임 탐색이 필요 없는 경우 즉시 종료 (검색 결과 테이블 등)
+                    if not search_frames:
+                        return []
 
                     # 2. 아이프레임 및 프레임 탐색 (최소한으로 제한하여 지연 방지)
                     all_frames = self.driver.find_elements(By.XPATH, "//iframe | //frame")
-                    # 너무 많은 프레임(광고 등)이 있는 경우 상위 몇 개만 확인
-                    if len(all_frames) > 5:
-                        all_frames = all_frames[:5]
+                    if len(all_frames) > 3: # 5개에서 3개로 더 축소
+                        all_frames = all_frames[:3]
                         
                     for f in all_frames:
                         try:
@@ -576,10 +579,10 @@ class KbidBrowser:
                     table_found = True
                     break
                 
-                # 중간에 로그인 페이지로 변했는지 재확인
+                # 중간에 로그인 페이지로 변했는지 재확인 (page_source 대신 current_url 사용으로 성능 최적화)
                 if i == 3:
                     try:
-                        if "MemID" in self.driver.page_source:
+                        if "login" in self.driver.current_url.lower():
                             print("   ⚠️ 로딩 중 로그인 페이지 감지 - 재로그인 대기")
                             if not self.wait_for_login(): return False
                             self.driver.get(url)
@@ -1111,25 +1114,35 @@ class KbidParser:
             "계약방법": self.get_val("계약방법")
         }
         
-        # [추가] 예상투찰가1 자동 계산 (기초금액 * 사정률 * 투찰하한율)
+        # [수정] 예상투찰가 자동 계산
         try:
             # 콤마 제거 후 float 변환
             clean_base = data["기초금액"].replace(",", "") if data["기초금액"] else ""
             base_val = float(clean_base) if clean_base else None
-            # 평균사정률 또는 사정률 라벨 탐색
+            limit_val = self._parse_float(data["투찰하한율"])
+            
+            # 예상투찰가1: 기초금액 * 투찰하한율
+            if base_val and limit_val:
+                est1 = base_val * (limit_val / 100.0)
+                data["예상투찰가1"] = format(int(est1), ',')
+                print(f"   💰 예상투찰가1 자동계산 완료: {data['예상투찰가1']} (하한율: {limit_val}%)")
+            else:
+                data["예상투찰가1"] = "-"
+
+            # 예상투찰가2: 기초금액 * 평균 사정률 * 투찰하한율
             rate_text = self.get_val("평균사정률") or self.get_val("사정률")
             rate_val = self._parse_float(rate_text)
-            limit_val = self._parse_float(data["투찰하한율"])
             
             if base_val and rate_val and limit_val:
                 # 공식: 기초금액 * (사정률/100) * (하한율/100)
-                estimated = base_val * (rate_val / 100.0) * (limit_val / 100.0)
-                data["예상투찰가1"] = format(int(estimated), ',')
-                print(f"   💰 예상투찰가1 자동계산 완료: {data['예상투찰가1']} (사정률: {rate_val}%)")
+                est2 = base_val * (rate_val / 100.0) * (limit_val / 100.0)
+                data["예상투찰가2"] = format(int(est2), ',')
+                print(f"   💰 예상투찰가2 자동계산 완료: {data['예상투찰가2']} (사정률: {rate_val}%)")
             else:
-                data["예상투찰가1"] = "-"
+                data["예상투찰가2"] = "-"
         except Exception as e:
             data["예상투찰가1"] = "-"
+            data["예상투찰가2"] = "-"
             print(f"   ⚠️ 예상투찰가 계산 실패: {e}")
         
         try:
